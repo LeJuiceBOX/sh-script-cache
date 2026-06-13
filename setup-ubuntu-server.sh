@@ -24,6 +24,12 @@ NEW_USER="admin"
 # If empty, the script aborts before it can lock you out.
 SSH_PUBLIC_KEY=""
 
+# Prompt to set a login password for the new user so they can use sudo.
+# "true"  = the script pauses and asks you to type a password (recommended).
+# "false" = no password set; sudo won't work until you set one manually or
+#           add a NOPASSWD rule. SSH stays key-only either way.
+SET_SUDO_PASSWORD="true"
+
 # --- Firewall ---
 # Local network allowed to reach SSH, in CIDR form (e.g. 192.168.1.0/24).
 # Leave empty to auto-detect the server's primary LAN subnet.
@@ -64,6 +70,7 @@ DELETE_LOGS_AFTER="true"
 WARNINGS=()
 STEP_UPDATES_DONE=false
 STEP_USER_DONE=false
+STEP_PWD_DONE=false
 STEP_SSH_DONE=false
 STEP_UFW_DONE=false
 STEP_F2B_DONE=false
@@ -117,6 +124,7 @@ print_summary() {
     log "Completed steps:"
     log "  [$([[ ${STEP_UPDATES_DONE}   == true ]] && echo x || echo ' ')] System updates & essential packages"
     log "  [$([[ ${STEP_USER_DONE}      == true ]] && echo x || echo ' ')] User account: ${NEW_USER}"
+    log "  [$([[ ${STEP_PWD_DONE}       == true ]] && echo x || echo ' ')] Sudo password set for ${NEW_USER}"
     log "  [$([[ ${STEP_SSH_DONE}       == true ]] && echo x || echo ' ')] SSH hardening"
     log "  [$([[ ${STEP_UFW_DONE}       == true ]] && echo x || echo ' ')] Firewall (UFW), SSH from: ${SSH_ALLOW_CIDR:-unset}"
     log "  [$([[ ${STEP_F2B_DONE}       == true ]] && echo x || echo ' ')] fail2ban"
@@ -237,6 +245,35 @@ cleanup_packages() {
 # ======================================================================
 # Step 3: User account creation
 # ======================================================================
+
+# Interactively set a login password for NEW_USER so they can use sudo.
+# Reads from /dev/tty (works even when stdin is a pipe). Non-fatal: if no
+# terminal is available, it warns and leaves the account password-disabled.
+# The password is never echoed or written to the log.
+set_user_password() {
+    info "Setting a login password for '${NEW_USER}' (required for sudo)..."
+
+    if [[ ! -e /dev/tty ]]; then
+        warn "No terminal available to prompt for a password. '${NEW_USER}' \
+cannot use sudo until you run: passwd ${NEW_USER}"
+        return 1
+    fi
+
+    local attempts=0
+    while (( attempts < 3 )); do
+        if passwd "${NEW_USER}" < /dev/tty; then
+            success "Password set for '${NEW_USER}'."
+            return 0
+        fi
+        attempts=$(( attempts + 1 ))
+        warn "Password not set (attempt ${attempts}/3)."
+    done
+
+    warn "Could not set a password after 3 attempts; run 'passwd ${NEW_USER}' \
+manually before using sudo."
+    return 1
+}
+
 create_user() {
     if [[ -z "${NEW_USER}" ]]; then
         die "NEW_USER is not set in the configuration block."
@@ -259,6 +296,16 @@ being locked out when password authentication is disabled later."
     info "Adding '${NEW_USER}' to the sudo group..."
     usermod -aG sudo "${NEW_USER}" || die "Failed to add user to sudo group."
     success "'${NEW_USER}' now has sudo privileges."
+
+    # Set a sudo password if requested (key-only SSH is unaffected).
+    if [[ "${SET_SUDO_PASSWORD}" == "true" ]]; then
+        if set_user_password; then
+            STEP_PWD_DONE=true
+        fi
+    else
+        warn "SET_SUDO_PASSWORD is not 'true'; no password set. '${NEW_USER}' \
+cannot use sudo until you set one (passwd ${NEW_USER}) or add a NOPASSWD rule."
+    fi
 
     local ssh_dir="/home/${NEW_USER}/.ssh"
     local auth_keys="${ssh_dir}/authorized_keys"
