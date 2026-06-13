@@ -8,9 +8,16 @@
 # Review the CONFIGURATION block below and fill in the required values
 # BEFORE running. Run as root (sudo). For the most reliable lockout
 # guardrail, run with:  sudo -E ./harden.sh
-#
+#-----------------------------------------
+# Installation
+# 1. Download
+#curl -fsSL https://raw.githubusercontent.com/LeJuiceBOX/sh-script-cache/refs/heads/main/setup-ubuntu-server.sh -o setup.sh
 
-set -euo pipefail
+# 2. Edit the config block (SSH_PUBLIC_KEY is required)
+#nano setup.sh
+#-----------------------------------------
+
+#set -euo pipefail
 
 # ======================================================================
 # Configuration  --  EDIT THESE BEFORE RUNNING
