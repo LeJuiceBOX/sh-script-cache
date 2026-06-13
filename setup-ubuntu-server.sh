@@ -29,12 +29,34 @@ SSH_PUBLIC_KEY=""
 # Leave empty to auto-detect the server's primary LAN subnet.
 SSH_ALLOW_CIDR=""
 
+# --- Docker (optional) ---
+# Set to "true" to install Docker. The user is NOT added to the docker
+# group, so Docker commands require sudo.
+INSTALL_DOCKER="true"
+
+# --- git (optional) ---
+# Set to "true" to install git.
+INSTALL_GIT="false"
+
+# Optional GitHub SSH key for the new user (e.g. a deploy or read key)
+# so they can clone/pull private repos via git@github.com.
+# Paste the PRIVATE key contents (the whole file, including the
+# BEGIN/END lines). Leave empty to skip. Requires INSTALL_GIT="true".
+# NOTE: storing a private key in this file is sensitive — see the notes
+# printed after the run. A read-only deploy key is the safest choice.
+GITHUB_SSH_PRIVATE_KEY=""
+
 # --- Tailscale (optional) ---
 # Set to "true" to install Tailscale.
 INSTALL_TAILSCALE="false"
 # Optional pre-auth key for unattended bring-up. If empty, the script
 # installs Tailscale and leaves it for you to run 'sudo tailscale up'.
 TAILSCALE_AUTHKEY=""
+
+# --- Cleanup ---
+# Set to "true" to delete this script's log file after the run finishes.
+# On-screen output is unaffected; only the persistent log is removed.
+DELETE_LOGS_AFTER="true"
 
 # ======================================================================
 # Internal state  --  do not edit
@@ -46,6 +68,8 @@ STEP_SSH_DONE=false
 STEP_UFW_DONE=false
 STEP_F2B_DONE=false
 STEP_DOCKER_DONE=false
+STEP_GIT_DONE=false
+STEP_GITHUB_KEY_DONE=false
 STEP_TAILSCALE_DONE=false
 
 # ======================================================================
@@ -97,6 +121,8 @@ print_summary() {
     log "  [$([[ ${STEP_UFW_DONE}       == true ]] && echo x || echo ' ')] Firewall (UFW), SSH from: ${SSH_ALLOW_CIDR:-unset}"
     log "  [$([[ ${STEP_F2B_DONE}       == true ]] && echo x || echo ' ')] fail2ban"
     log "  [$([[ ${STEP_DOCKER_DONE}    == true ]] && echo x || echo ' ')] Docker (sudo-gated, user NOT in docker group)"
+    log "  [$([[ ${STEP_GIT_DONE}       == true ]] && echo x || echo ' ')] git (optional)"
+    log "  [$([[ ${STEP_GITHUB_KEY_DONE} == true ]] && echo x || echo ' ')] GitHub SSH key for ${NEW_USER} (optional)"
     log "  [$([[ ${STEP_TAILSCALE_DONE} == true ]] && echo x || echo ' ')] Tailscale (optional)"
 
     log ""
@@ -121,8 +147,18 @@ print_summary() {
     log "${C_WARN}IMPORTANT:${C_RESET} Keep your CURRENT SSH session open."
     log "Open a NEW terminal and verify you can log in as '${NEW_USER}' via key"
     log "BEFORE you disconnect — password login and root login are now disabled."
-    log "Full log: ${LOG_FILE}"
+    if [[ "${DELETE_LOGS_AFTER}" == "true" ]]; then
+        log "Setup log will be deleted now (DELETE_LOGS_AFTER=true)."
+    else
+        log "Full log: ${LOG_FILE}"
+    fi
     log "======================================================================"
+
+    # Must be the very last action: remove the persistent log file.
+    # On-screen output above is unaffected.
+    if [[ "${DELETE_LOGS_AFTER}" == "true" ]]; then
+        rm -f "${LOG_FILE}" 2>/dev/null || true
+    fi
 }
 
 # ======================================================================
@@ -418,7 +454,7 @@ install_docker() {
     info "Adding Docker's official GPG key..."
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o "${keyring}" \
-        || die "Failed to download Docker GPG key."
+        || { warn "Failed to download Docker GPG key."; return 1; }
     chmod a+r "${keyring}"
 
     info "Adding Docker apt repository..."
@@ -429,17 +465,18 @@ install_docker() {
 https://download.docker.com/linux/ubuntu ${codename} stable" > "${repo_list}"
 
     info "Updating package lists with Docker repo..."
-    apt-get update -y >>"$LOG_FILE" 2>&1 || die "apt-get update failed after adding Docker repo."
+    apt-get update -y >>"$LOG_FILE" 2>&1 \
+        || { warn "apt-get update failed after adding Docker repo."; return 1; }
 
     info "Installing Docker Engine, CLI, containerd, and plugins..."
     apt-get install -y \
         docker-ce docker-ce-cli containerd.io \
         docker-buildx-plugin docker-compose-plugin \
-        >>"$LOG_FILE" 2>&1 || die "Failed to install Docker packages."
+        >>"$LOG_FILE" 2>&1 || { warn "Failed to install Docker packages."; return 1; }
 
     info "Enabling and starting Docker service..."
     systemctl enable --now docker >>"$LOG_FILE" 2>&1 \
-        || die "Failed to enable/start Docker."
+        || { warn "Failed to enable/start Docker."; return 1; }
 
     # Deliberately NOT adding ${NEW_USER} to the 'docker' group.
     # Docker group membership is root-equivalent; requiring 'sudo docker'
@@ -450,9 +487,77 @@ Docker commands will require sudo."
     local docker_ver compose_ver
     docker_ver="$(docker --version 2>/dev/null || true)"
     compose_ver="$(docker compose version 2>/dev/null || true)"
-    [[ -n "${docker_ver}" ]] || die "Docker install verification failed."
+    [[ -n "${docker_ver}" ]] || { warn "Docker install verification failed."; return 1; }
     success "Installed: ${docker_ver}"
     [[ -n "${compose_ver}" ]] && success "Compose plugin: ${compose_ver}"
+}
+
+# ======================================================================
+# Optional: git installation
+# ======================================================================
+install_git() {
+    info "Installing git (optional step)..."
+    apt-get install -y git >>"$LOG_FILE" 2>&1 \
+        || { warn "Failed to install git."; return 1; }
+    success "git installed: $(git --version 2>/dev/null || echo 'version unknown')"
+}
+
+# ----------------------------------------------------------------------
+# Optional: install a GitHub SSH key for NEW_USER (deploy/read key)
+# so they can use git@github.com for private repos. The private key is
+# written directly to the user's ~/.ssh with 600 perms and is never
+# echoed to the log.
+# ----------------------------------------------------------------------
+configure_github_key() {
+    if [[ -z "${GITHUB_SSH_PRIVATE_KEY}" ]]; then
+        info "No GITHUB_SSH_PRIVATE_KEY provided; skipping GitHub key setup."
+        return 0
+    fi
+
+    if ! command -v git &>/dev/null; then
+        warn "GitHub key provided but git is not installed; skipping. \
+Set INSTALL_GIT=\"true\"."
+        return 1
+    fi
+
+    local ssh_dir="/home/${NEW_USER}/.ssh"
+    local key_file="${ssh_dir}/github_id"
+    local cfg_file="${ssh_dir}/config"
+    local known="${ssh_dir}/known_hosts"
+
+    info "Installing GitHub SSH key for '${NEW_USER}'..."
+    mkdir -p "${ssh_dir}"
+
+    # Write the private key WITHOUT routing through the log.
+    printf '%s\n' "${GITHUB_SSH_PRIVATE_KEY}" > "${key_file}"
+    chmod 600 "${key_file}"
+
+    # Add an SSH config entry so git@github.com uses this key.
+    if [[ ! -f "${cfg_file}" ]] || ! grep -q "Host github.com" "${cfg_file}"; then
+        cat >> "${cfg_file}" <<EOF
+
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ${key_file}
+    IdentitiesOnly yes
+EOF
+        chmod 600 "${cfg_file}"
+    fi
+
+    # Pin GitHub's host keys so the first clone doesn't prompt.
+    info "Adding github.com to known_hosts..."
+    if ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> "${known}" 2>>"$LOG_FILE"; then
+        # De-duplicate in case the script is re-run.
+        sort -u "${known}" -o "${known}"
+        chmod 644 "${known}"
+    else
+        warn "ssh-keyscan for github.com failed (no network?); \
+the first clone may prompt to verify the host key."
+    fi
+
+    chown -R "${NEW_USER}:${NEW_USER}" "${ssh_dir}"
+    success "GitHub SSH key configured for '${NEW_USER}'."
 }
 
 # ======================================================================
@@ -531,9 +636,36 @@ main() {
     configure_fail2ban
     STEP_F2B_DONE=true
 
-    # Step 7: Docker
-    install_docker
-    STEP_DOCKER_DONE=true
+    # Step 7: Docker (optional, non-fatal — failure won't abort the run)
+    if [[ "${INSTALL_DOCKER}" == "true" ]]; then
+        if install_docker; then
+            STEP_DOCKER_DONE=true
+        else
+            warn "Docker step did not complete successfully."
+        fi
+    else
+        info "Skipping Docker (INSTALL_DOCKER != true)."
+    fi
+
+    # Optional: git
+    if [[ "${INSTALL_GIT}" == "true" ]]; then
+        if install_git; then
+            STEP_GIT_DONE=true
+        else
+            warn "git step did not complete successfully."
+        fi
+    else
+        info "Skipping git (INSTALL_GIT != true)."
+    fi
+
+    # Optional: GitHub SSH key (only meaningful once git is present)
+    if [[ -n "${GITHUB_SSH_PRIVATE_KEY}" ]]; then
+        if configure_github_key; then
+            STEP_GITHUB_KEY_DONE=true
+        else
+            warn "GitHub key step did not complete successfully."
+        fi
+    fi
 
     # Optional: Tailscale (non-fatal — failure won't abort the run)
     if [[ "${INSTALL_TAILSCALE}" == "true" ]]; then
